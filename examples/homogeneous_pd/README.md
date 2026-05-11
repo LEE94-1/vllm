@@ -56,7 +56,9 @@ One command on every machine that will run a node and on the router host:
 ./examples/homogeneous_pd/launchers/install.sh
 ```
 
-The installer uses **only** the stdlib `python -m venv` and `pip`, so every
+The installer assumes you are inside an already-isolated environment
+(typically a container) and installs **straight into the system Python on
+PATH** using plain `pip` — no venv, no uv, no Python download. Every
 package fetch goes through whatever you have configured in `pip.conf` /
 `PIP_INDEX_URL`. Nothing else is downloaded from the public internet (no
 `astral.sh/uv`, no `wheels.vllm.ai`, no extra PyTorch index, no
@@ -64,8 +66,7 @@ python-build-standalone tarball).
 
 What it does, in order:
 
-1. Creates `.venv` at the repo root using your system `python3` (override
-   with `PYTHON_BIN=python3.12`).
+1. Prints `pip config list` so you can verify the active mirror.
 2. `pip install --upgrade pip setuptools wheel`.
 3. `pip install vllm` (from your pip mirror — the local repo's vllm source
    is **not** rebuilt; the in-repo `examples/homogeneous_pd/` package is
@@ -99,14 +100,16 @@ If `nixl` is not on the mirror, you have to fetch it into your environment
 manually before running the launchers — KV transfer between nodes will not
 work otherwise.
 
-Partial reruns:
+Partial reruns and extra pip flags:
 
 ```bash
-PYTHON_BIN=python3.12 ./install.sh   # pick a specific system Python
-SKIP_VLLM=1         ./install.sh     # only proxy deps + nixl + flashinfer
-SKIP_NIXL=1         ./install.sh     # skip nixl (install manually later)
-SKIP_FLASHINFER=1   ./install.sh     # skip flashinfer
-SKIP_DEPS=1         ./install.sh     # skip aiohttp/httpx/fastapi/uvicorn/pytest
+PYTHON_BIN=python3.10 ./install.sh                # pick a specific interpreter
+PIP_FLAGS="--break-system-packages" ./install.sh  # PEP 668 environments
+PIP_FLAGS="--no-build-isolation" ./install.sh     # avoid building isolated envs
+SKIP_VLLM=1         ./install.sh                  # only proxy deps + nixl + flashinfer
+SKIP_NIXL=1         ./install.sh                  # skip nixl (install manually later)
+SKIP_FLASHINFER=1   ./install.sh                  # skip flashinfer
+SKIP_DEPS=1         ./install.sh                  # skip aiohttp/httpx/fastapi/uvicorn/pytest
 ```
 
 After install, mark the launchers executable on the server:

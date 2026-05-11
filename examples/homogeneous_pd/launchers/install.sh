@@ -4,12 +4,14 @@
 #
 # Installer for the homogeneous_pd experiment.
 #
-# This script intentionally uses ONLY stdlib `python -m venv` and `pip`, so
-# every package fetch goes through whatever you have configured in
-# ~/.pip/pip.conf / /etc/pip.conf (or the PIP_INDEX_URL env var). Nothing
-# else is downloaded from the public internet: no uv installer from
-# astral.sh, no precompiled wheel from wheels.vllm.ai, no extra PyTorch
-# index, no python-build-standalone tarball.
+# Designed for container environments: installs straight into whatever
+# Python is already on PATH, no venv, no uv, no Python download. Every
+# package fetch goes through `pip`, which means whatever you have
+# configured in /etc/pip.conf / ~/.pip/pip.conf / PIP_INDEX_URL is
+# honoured. Nothing is downloaded from the public internet outside pip:
+# no uv installer from astral.sh, no precompiled wheel from
+# wheels.vllm.ai, no extra PyTorch index, no python-build-standalone
+# tarball.
 #
 # Packages installed via pip (each of these must exist on your mirror):
 #
@@ -25,16 +27,16 @@
 #   SKIP_DEPS=1        ./install.sh  # skip aiohttp/httpx/fastapi/uvicorn/pytest
 #   SKIP_NIXL=1        ./install.sh  # skip nixl
 #   SKIP_FLASHINFER=1  ./install.sh  # skip flashinfer
-#   PYTHON_BIN=python3.12 ./install.sh   # pick a specific system Python interpreter
+#   PYTHON_BIN=python3.10 ./install.sh   # pick a specific python interpreter
+#   PIP_FLAGS="--user" ./install.sh  # extra pip flags (e.g. --user, --break-system-packages)
 #
 # Notes
 # -----
-# 1. We do NOT install vLLM in editable mode (`pip install -e .`) because
-#    that path needs either the CUDA toolkit to compile or VLLM_USE_PRECOMPILED
-#    which fetches from wheels.vllm.ai. Plain `pip install vllm` instead
-#    gets a CUDA-ready wheel from your configured mirror, and the local
-#    homogeneous_pd/ scheduler+proxy modules are loaded via PYTHONPATH
-#    (see launchers/common.sh) so the on-disk source still drives behaviour.
+# 1. vLLM is installed via plain `pip install vllm` (NOT `-e .` from this
+#    repo), so the install does not need a CUDA toolkit and does not hit
+#    wheels.vllm.ai. The in-repo `examples/homogeneous_pd/` package is
+#    loaded by the launchers via PYTHONPATH (see launchers/common.sh) so
+#    edits to the on-disk scheduler/proxy still drive behaviour.
 # 2. If your mirror does not carry `flashinfer-python` or `nixl`, the
 #    script prints a warning and continues; install them manually later.
 
@@ -49,52 +51,47 @@ SKIP_VLLM=${SKIP_VLLM:-0}
 SKIP_DEPS=${SKIP_DEPS:-0}
 SKIP_NIXL=${SKIP_NIXL:-0}
 SKIP_FLASHINFER=${SKIP_FLASHINFER:-0}
+# Anything the caller wants to forward to every `pip install`. Use this for
+# --user, --break-system-packages, --no-build-isolation, etc.
+PIP_FLAGS=${PIP_FLAGS:-}
 
 step() { printf '\n==> %s\n' "$*"; }
 
-step "Repo root  : ${REPO_ROOT}"
-step "Python bin : $(command -v "${PYTHON_BIN}" || echo '<missing>')"
-
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "${PYTHON_BIN} not found. Install Python 3.10+ via your apt repo and retry," >&2
-  echo "or set PYTHON_BIN to a working interpreter (e.g. PYTHON_BIN=python3.12)." >&2
+  echo "or set PYTHON_BIN to a working interpreter (e.g. PYTHON_BIN=python3.10)." >&2
   exit 1
 fi
 
-step "Python version: $("${PYTHON_BIN}" --version)"
+step "Repo root  : ${REPO_ROOT}"
+step "Python bin : $(command -v "${PYTHON_BIN}") ($("${PYTHON_BIN}" --version))"
+
+# Shorthand: every install command goes through "${PYTHON_BIN}" -m pip with
+# the user's optional PIP_FLAGS appended.
+pip_install() {
+  # shellcheck disable=SC2086  # we deliberately word-split PIP_FLAGS
+  "${PYTHON_BIN}" -m pip install ${PIP_FLAGS} "$@"
+}
 
 # ---------------------------------------------------------------------------
-# 1. Create a venv (stdlib only; no network).
+# 1. Print the pip config that is actually in effect, so misconfigured
+#    mirrors are obvious from the install log.
 # ---------------------------------------------------------------------------
-VENV_DIR=${VENV_DIR:-${REPO_ROOT}/.venv}
-if [[ ! -d "${VENV_DIR}" ]]; then
-  step "Creating virtualenv at ${VENV_DIR} ..."
-  "${PYTHON_BIN}" -m venv "${VENV_DIR}"
-else
-  step "Re-using existing virtualenv at ${VENV_DIR}"
-fi
-
-# shellcheck source=/dev/null
-source "${VENV_DIR}/bin/activate"
-step "Active interpreter: $(command -v python) ($(python --version))"
-
-# Print the pip index URL the user has configured so misconfiguration is
-# obvious from the install log.
 step "pip config (effective):"
-python -m pip config list 2>/dev/null || true
+"${PYTHON_BIN}" -m pip config list 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# 2. Upgrade pip itself (still goes through your mirror).
+# 2. Upgrade pip itself (also via the mirror).
 # ---------------------------------------------------------------------------
 step "Upgrading pip / setuptools / wheel ..."
-python -m pip install --upgrade pip setuptools wheel
+pip_install --upgrade pip setuptools wheel
 
 # ---------------------------------------------------------------------------
 # 3. vLLM (from whatever your pip mirror has tagged as `vllm`).
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_VLLM}" != "1" ]]; then
   step "Installing vllm ..."
-  python -m pip install vllm
+  pip_install vllm
 fi
 
 # ---------------------------------------------------------------------------
@@ -102,7 +99,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_DEPS}" != "1" ]]; then
   step "Installing proxy + test dependencies ..."
-  python -m pip install \
+  pip_install \
     aiohttp \
     httpx \
     fastapi \
@@ -115,7 +112,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_FLASHINFER}" != "1" ]]; then
   step "Installing flashinfer-python (best-effort) ..."
-  if python -m pip install flashinfer-python; then
+  if pip_install flashinfer-python; then
     echo "    flashinfer-python installed."
   else
     cat <<'EOF'
@@ -133,7 +130,7 @@ fi
 # ---------------------------------------------------------------------------
 if [[ "${SKIP_NIXL}" != "1" ]]; then
   step "Installing nixl (best-effort) ..."
-  if python -m pip install nixl; then
+  if pip_install nixl; then
     echo "    nixl installed."
   else
     cat <<'EOF'
@@ -154,7 +151,7 @@ fi
 # 7. Smoke test: scheduler import + budget function.
 # ---------------------------------------------------------------------------
 step "Verifying scheduler import ..."
-PYTHONPATH="${EXAMPLES_DIR}:${PYTHONPATH:-}" python - <<'PY'
+PYTHONPATH="${EXAMPLES_DIR}:${PYTHONPATH:-}" "${PYTHON_BIN}" - <<'PY'
 from homogeneous_pd.scheduler.budget_fn import linear_ratio
 from homogeneous_pd.scheduler.homogeneous_scheduler import HomogeneousScheduler  # noqa: F401
 assert linear_ratio(decode_tokens=4, alpha=16, max_batched=8192) == 64
@@ -167,13 +164,10 @@ PY
 cat <<EOF
 
 ============================================================
-Install complete.
-
-Activate the virtualenv in any new shell with:
-  source ${VENV_DIR}/bin/activate
+Install complete (system / container Python: $(command -v "${PYTHON_BIN}")).
 
 Run the CPU-only unit tests:
-  python -m pytest examples/homogeneous_pd/tests -v
+  ${PYTHON_BIN} -m pytest examples/homogeneous_pd/tests -v
 
 Distributed deployment (run on each machine):
   1. Configure cluster networking once per host:
