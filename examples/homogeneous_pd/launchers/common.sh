@@ -14,8 +14,11 @@
 #     `homogeneous_pd.scheduler.homogeneous_scheduler.HomogeneousScheduler`
 #     can be loaded via `--scheduler-cls`.
 #   * MODEL, BLOCK_SIZE, MAX_MODEL_LEN, MAX_NUM_BATCHED_TOKENS, MAX_NUM_SEQS,
-#     GPU_MEMORY_UTILIZATION, KV_BUFFER_DEVICE, ALPHA, BUDGET_FN
+#     GPU_MEMORY_UTILIZATION, KV_BUFFER_DEVICE, TENSOR_PARALLEL_SIZE,
+#     TRUST_REMOTE_CODE, ENFORCE_EAGER, ATTENTION_BACKEND, ALPHA, BUDGET_FN
 #     are filled in from environment variables or defaulted.
+#   * Cluster networking env vars (NCCL/GLOO/UCX/RDMA) sourced from
+#     ${HOMOGENEOUS_DIR}/configs/cluster_env.sh if it exists.
 #   * Functions: get_num_gpus, wait_for_server, register_pid,
 #     stop_all_pids, _kv_config_homogeneous, _kv_config_pd_disagg.
 
@@ -34,6 +37,16 @@ export REPO_ROOT EXAMPLES_DIR HOMOGENEOUS_DIR
 
 export PYTHONPATH="${EXAMPLES_DIR}:${PYTHONPATH:-}"
 
+# ---- Cluster networking (NCCL / GLOO / UCX-for-NIXL) ------------------------
+#
+# Sourced once per machine; lives outside the topology config because it
+# describes the *host* (NICs, IB devices) not the experiment.
+CLUSTER_ENV=${CLUSTER_ENV:-${HOMOGENEOUS_DIR}/configs/cluster_env.sh}
+if [[ -f "${CLUSTER_ENV}" ]]; then
+  # shellcheck disable=SC1090
+  source "${CLUSTER_ENV}"
+fi
+
 # ---- Defaults ---------------------------------------------------------------
 
 MODEL=${MODEL:-meta-llama/Llama-3.1-8B-Instruct}
@@ -43,6 +56,14 @@ MAX_NUM_BATCHED_TOKENS=${MAX_NUM_BATCHED_TOKENS:-8192}
 MAX_NUM_SEQS=${MAX_NUM_SEQS:-256}
 GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.85}
 KV_BUFFER_DEVICE=${KV_BUFFER_DEVICE:-cuda}
+
+# Per-node model-execution knobs (overridable per topology config).
+TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}       # 1 -> pass --trust-remote-code
+ENFORCE_EAGER=${ENFORCE_EAGER:-0}               # 1 -> pass --enforce-eager
+# Attention backend is read by vLLM from this env var; empty means leave
+# it to vLLM's autodetection. Common values: FLASHINFER, FLASH_ATTN, TRITON_ATTN.
+ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
 
 # Homogeneous-PD-specific knobs (only used by run_homogeneous_*.sh).
 ALPHA=${ALPHA:-16}

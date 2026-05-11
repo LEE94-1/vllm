@@ -22,6 +22,7 @@ examples/homogeneous_pd/
 ├── README.md                              (this file)
 ├── configs/                               topology configs (per-experiment)
 │   ├── README.md
+│   ├── cluster_env.example.sh             host-level NCCL/UCX/RDMA env
 │   ├── 1p1d.example.conf
 │   ├── 3p1d.example.conf
 │   ├── homogeneous_2node.example.conf
@@ -55,33 +56,93 @@ One command on every machine that will run a node and on the router host:
 ./examples/homogeneous_pd/launchers/install.sh
 ```
 
-What it does:
+The installer uses **only** the stdlib `python -m venv` and `pip`, so every
+package fetch goes through whatever you have configured in `pip.conf` /
+`PIP_INDEX_URL`. Nothing else is downloaded from the public internet (no
+`astral.sh/uv`, no `wheels.vllm.ai`, no extra PyTorch index, no
+python-build-standalone tarball).
 
-1. Installs `uv` (if missing).
-2. Creates `.venv` at the repo root with Python 3.12.
-3. Installs vLLM via the precompiled wheel (`VLLM_USE_PRECOMPILED=1`).
-4. Installs `aiohttp` / `httpx` / `fastapi` / `uvicorn[standard]` / `pytest`.
-5. Best-effort `pip install nixl` (required for cross-node KV transfer).
-6. Smoke-tests the scheduler import.
+What it does, in order:
 
-Useful flags:
+1. Creates `.venv` at the repo root using your system `python3` (override
+   with `PYTHON_BIN=python3.12`).
+2. `pip install --upgrade pip setuptools wheel`.
+3. `pip install vllm` (from your pip mirror — the local repo's vllm source
+   is **not** rebuilt; the in-repo `examples/homogeneous_pd/` package is
+   loaded purely via `PYTHONPATH` so the on-disk scheduler still drives
+   behaviour).
+4. `pip install aiohttp httpx fastapi "uvicorn[standard]" pytest`.
+5. Best-effort `pip install flashinfer-python` (only needed for
+   `ATTENTION_BACKEND=FLASHINFER`; warned but not fatal if missing).
+6. Best-effort `pip install nixl` (required for cross-node KV transfer;
+   warned but not fatal if missing).
+7. Smoke-tests `homogeneous_pd.scheduler` import.
+
+Packages your pip mirror **must** carry. `pip install vllm` will recursively
+pull `torch`, `xformers`, etc.; if any are missing for your CUDA version
+the install fails fast at that step.
+
+| Required (direct or transitive) | Optional but recommended |
+| -------- | ------------------------ |
+| `vllm` (and its deps: `torch`, `xformers`, `transformers`, `tokenizers`, ...), `aiohttp`, `httpx`, `fastapi`, `uvicorn[standard]`, `pytest`, `pip`, `setuptools`, `wheel` | `flashinfer-python` (matching your CUDA), `nixl` |
+
+Pre-flight check against your mirror:
 
 ```bash
-PYTHON_VERSION=3.11 ./install.sh    # different Python
-SKIP_VLLM=1        ./install.sh    # only proxy deps + nixl
-SKIP_NIXL=1        ./install.sh    # skip nixl (install manually later)
-SKIP_DEPS=1        ./install.sh    # skip aiohttp/httpx/fastapi/uvicorn/pytest
+pip download --no-deps --dest /tmp/_check vllm \
+    aiohttp httpx fastapi 'uvicorn[standard]' pytest \
+    flashinfer-python nixl 2>&1 | tee /tmp/_check.log
+pip download --dest /tmp/_check_full vllm 2>&1 | tee /tmp/_check_full.log
 ```
 
-If your distribution requires a system-level NIXL build, follow
-[ai-dynamo/nixl](https://github.com/ai-dynamo/nixl) instead and re-run with
-`SKIP_NIXL=1`.
+If `nixl` is not on the mirror, you have to fetch it into your environment
+manually before running the launchers — KV transfer between nodes will not
+work otherwise.
+
+Partial reruns:
+
+```bash
+PYTHON_BIN=python3.12 ./install.sh   # pick a specific system Python
+SKIP_VLLM=1         ./install.sh     # only proxy deps + nixl + flashinfer
+SKIP_NIXL=1         ./install.sh     # skip nixl (install manually later)
+SKIP_FLASHINFER=1   ./install.sh     # skip flashinfer
+SKIP_DEPS=1         ./install.sh     # skip aiohttp/httpx/fastapi/uvicorn/pytest
+```
 
 After install, mark the launchers executable on the server:
 
 ```bash
 chmod +x examples/homogeneous_pd/launchers/*.sh
 ```
+
+## Cluster networking (NCCL / GLOO / UCX-for-NIXL)
+
+Anything that depends on the *host* (RDMA NIC names, IB devices, the
+Ethernet interface that the router can reach) belongs in
+`configs/cluster_env.sh`, **not** in the per-experiment topology config.
+`launchers/common.sh` sources it automatically when present.
+
+```bash
+cp examples/homogeneous_pd/configs/cluster_env.example.sh \
+   examples/homogeneous_pd/configs/cluster_env.sh
+$EDITOR examples/homogeneous_pd/configs/cluster_env.sh
+```
+
+Inside that file you set the same NICs your SGLang scripts use, e.g. on a
+typical 8x A800 box with 4x ConnectX RDMA NICs:
+
+```bash
+export NCCL_SOCKET_IFNAME=ens22f0
+export GLOO_SOCKET_IFNAME=ens22f0
+export NCCL_IB_HCA=mlx5_2,mlx5_3,mlx5_6,mlx5_7
+
+# This is what makes NIXL pick the RDMA path:
+export UCX_NET_DEVICES=mlx5_2:1,mlx5_3:1,mlx5_6:1,mlx5_7:1
+export UCX_TLS=rc,cuda_copy,cuda_ipc
+```
+
+`launch_node.sh` prints the resolved UCX devices on startup so you can
+confirm the right NICs are being used.
 
 ## How the homogeneous scheduler works
 
@@ -229,23 +290,48 @@ processes are killed automatically. If a launcher dies uncleanly, run
 Defined and documented in `launchers/common.sh`. Either export them before
 running, or set them inside your topology config:
 
-| Variable                  | Default                                  |
-| ------------------------- | ---------------------------------------- |
-| `MODEL`                   | `meta-llama/Llama-3.1-8B-Instruct`       |
-| `BLOCK_SIZE`              | `16`                                     |
-| `MAX_MODEL_LEN`           | `16384`                                  |
-| `MAX_NUM_BATCHED_TOKENS`  | `8192`                                   |
-| `MAX_NUM_SEQS`            | `256`                                    |
-| `GPU_MEMORY_UTILIZATION`  | `0.85`                                   |
-| `KV_BUFFER_DEVICE`        | `cuda`                                   |
-| `ALPHA` (homogeneous)     | `16`                                     |
-| `BUDGET_FN` (homogeneous) | `linear_ratio`                           |
-| `PROXY_PORT` / `ROUTER_PORT` | `8000`                                |
-| `LOG_DIR`                 | `/tmp/homogeneous_pd_logs`               |
+| Variable                  | Default                                  | Notes                                                          |
+| ------------------------- | ---------------------------------------- | -------------------------------------------------------------- |
+| `MODEL`                   | `meta-llama/Llama-3.1-8B-Instruct`       | HF repo or local path (e.g. an NFS-mounted ckpt directory).    |
+| `TENSOR_PARALLEL_SIZE`    | `1`                                      | Set to `8` for a full 8x A100/A800 box. `NODE_GPUS[i]` should list exactly that many GPU ids. |
+| `TRUST_REMOTE_CODE`       | `0`                                      | `1` -> pass `--trust-remote-code` (needed for Kimi-K2, etc.).  |
+| `ATTENTION_BACKEND`       | _(empty)_                                | Sets `VLLM_ATTENTION_BACKEND`. Common: `FLASHINFER`, `FLASH_ATTN`. |
+| `ENFORCE_EAGER`           | `0`                                      | `1` -> pass `--enforce-eager` (disable CUDA graphs).           |
+| `BLOCK_SIZE`              | `16`                                     |                                                                |
+| `MAX_MODEL_LEN`           | `16384`                                  |                                                                |
+| `MAX_NUM_BATCHED_TOKENS`  | `8192`                                   | vLLM's equivalent of `--chunked-prefill-size` in SGLang.       |
+| `MAX_NUM_SEQS`            | `256`                                    |                                                                |
+| `GPU_MEMORY_UTILIZATION`  | `0.85`                                   | Matches SGLang's `--mem-fraction-static`.                      |
+| `KV_BUFFER_DEVICE`        | `cuda`                                   |                                                                |
+| `ALPHA` (homogeneous)     | `16`                                     | Slope of `linear_ratio` (default budget function).             |
+| `BUDGET_FN` (homogeneous) | `linear_ratio`                           |                                                                |
+| `PROXY_PORT` / `ROUTER_PORT` | `8000`                                | Where the router (NIXL toy proxy / round-robin proxy) binds.   |
+| `LOG_DIR`                 | `/tmp/homogeneous_pd_logs`               | Per-node logs go here.                                         |
 
-For a fair comparison, keep `MODEL`, `BLOCK_SIZE`, `MAX_MODEL_LEN`,
-`MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS`, and `GPU_MEMORY_UTILIZATION`
-identical across the four configurations.
+For a fair comparison, keep `MODEL`, `TENSOR_PARALLEL_SIZE`, `BLOCK_SIZE`,
+`MAX_MODEL_LEN`, `MAX_NUM_BATCHED_TOKENS`, `MAX_NUM_SEQS`,
+`GPU_MEMORY_UTILIZATION`, and `ATTENTION_BACKEND` identical across the four
+configurations.
+
+### Mapping from SGLang flags (for reference)
+
+If you are coming from SGLang, the per-config overrides translate as follows:
+
+| SGLang flag                                | vLLM config knob                          |
+| ------------------------------------------ | ----------------------------------------- |
+| `--model-path /nfs/.../Kimi-K2___5_reap_E288` | `MODEL=/nfs/.../Kimi-K2___5_reap_E288`     |
+| `--tp-size 8`                              | `TENSOR_PARALLEL_SIZE=8`, `NODE_GPUS[i]="0,1,2,3,4,5,6,7"` |
+| `--trust-remote-code`                      | `TRUST_REMOTE_CODE=1`                     |
+| `--attention-backend flashinfer`           | `ATTENTION_BACKEND=FLASHINFER`            |
+| `--chunked-prefill-size 16384`             | `MAX_NUM_BATCHED_TOKENS=16384`            |
+| `--mem-fraction-static 0.85`               | `GPU_MEMORY_UTILIZATION=0.85`             |
+| `--port 61003`                             | `NODE_PORTS=(61003 ...)`                  |
+| `--disaggregation-transfer-backend nixl`   | (already, via `NixlConnector`)            |
+| `--disaggregation-ib-device mlx5_2,...`    | `UCX_NET_DEVICES=mlx5_2:1,...` in `cluster_env.sh` |
+| `NCCL_SOCKET_IFNAME=ens22f0`, etc.         | put them in `cluster_env.sh`              |
+| `--load-balance-method follow_bootstrap_room` | n/a — the NIXL toy proxy already pairs P→D per request |
+| `--load-balance-method round_robin`        | The homogeneous router does plain round-robin.           |
+| `SGL_*` / `MOONCAKE_*` / `ENABLE_SWAPAB` / `NVSHMEM_*` | SGLang-only, no vLLM equivalent — leave unset.   |
 
 ### Plugging in your benchmark
 

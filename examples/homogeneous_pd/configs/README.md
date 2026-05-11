@@ -1,13 +1,21 @@
 # Topology configuration files
 
-A *topology config* is a small bash file (sourced by the launchers) that
-describes:
+There are two kinds of config in this directory:
 
-- which IPs / ports / GPUs make up the cluster,
-- whether the cluster is **PD-disaggregated** (`TYPE=pd_disagg`) or
-  **homogeneous PD** (`TYPE=homogeneous`),
-- the model and homogeneous-scheduler knobs (`ALPHA`, `BUDGET_FN`, ...),
-- where the router listens (`ROUTER_HOST`, `ROUTER_PORT`).
+- `cluster_env.example.sh` is the **host** networking config (NCCL / GLOO /
+  UCX / RDMA env vars). It is sourced automatically by
+  `launchers/common.sh` when present at `configs/cluster_env.sh`. Copy
+  the example once per machine and edit the NIC / IB device names to
+  match your hardware.
+- `*.example.conf` files are **topology / experiment** configs. They
+  describe:
+  - which IPs / ports / GPUs make up the cluster,
+  - whether the cluster is **PD-disaggregated** (`TYPE=pd_disagg`) or
+    **homogeneous PD** (`TYPE=homogeneous`),
+  - the model and homogeneous-scheduler knobs (`ALPHA`, `BUDGET_FN`, ...),
+  - per-node execution knobs (`TENSOR_PARALLEL_SIZE`, `TRUST_REMOTE_CODE`,
+    `ATTENTION_BACKEND`, `ENFORCE_EAGER`),
+  - where the router listens (`ROUTER_HOST`, `ROUTER_PORT`).
 
 Pick one of the four `*.example.conf` files in this directory, copy it to
 `<my_setup>.conf`, edit the IPs / GPUs / ports for your hardware, then:
@@ -35,6 +43,22 @@ Pick one of the four `*.example.conf` files in this directory, copy it to
 
 All five `NODE_*` arrays plus `ROLES` MUST have the same length; index `i`
 describes the same node across all of them.
+
+## Per-node execution knobs
+
+Optional per-config overrides that get baked into the `vllm serve`
+invocation:
+
+| Variable                | Default | Notes                                                              |
+| ----------------------- | ------- | ------------------------------------------------------------------ |
+| `TENSOR_PARALLEL_SIZE`  | `1`     | TP within each node. `NODE_GPUS[i]` must list exactly this many GPU ids. |
+| `TRUST_REMOTE_CODE`     | `0`     | `1` -> pass `--trust-remote-code`.                                 |
+| `ATTENTION_BACKEND`     | _empty_ | Sets `VLLM_ATTENTION_BACKEND` (e.g. `FLASHINFER`).                 |
+| `ENFORCE_EAGER`         | `0`     | `1` -> pass `--enforce-eager` (disable CUDA graphs).               |
+| `GPU_MEMORY_UTILIZATION`| `0.85`  | Same role as SGLang's `--mem-fraction-static`.                     |
+| `MAX_NUM_BATCHED_TOKENS`| `8192`  | Same role as SGLang's `--chunked-prefill-size`.                    |
+| `MAX_NUM_SEQS`          | `256`   |                                                                    |
+| `MAX_MODEL_LEN`         | `16384` |                                                                    |
 
 ## Homogeneous-only knobs
 

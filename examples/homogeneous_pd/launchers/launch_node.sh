@@ -104,6 +104,24 @@ case "${TYPE}" in
     ;;
 esac
 
+# ---- Optional flags from config / defaults ----------------------------------
+
+# Trust remote code (HF models with custom Python).
+if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
+  EXTRA_ARGS+=(--trust-remote-code)
+fi
+
+# Enforce eager (skip CUDA graphs). Default off so users get CUDA graphs.
+if [[ "${ENFORCE_EAGER}" == "1" ]]; then
+  EXTRA_ARGS+=(--enforce-eager)
+fi
+
+# Attention backend: set via env (vLLM reads VLLM_ATTENTION_BACKEND) so we
+# do not hard-fail if the running vLLM build does not accept the CLI flag.
+if [[ -n "${ATTENTION_BACKEND}" ]]; then
+  export VLLM_ATTENTION_BACKEND="${ATTENTION_BACKEND}"
+fi
+
 LOG="${LOG_DIR}/node_${NODE_IDX}.log"
 
 echo "============================================================"
@@ -111,9 +129,14 @@ echo "Launching node #${NODE_IDX} from ${CONFIG}"
 echo "  TYPE     : ${TYPE}"
 echo "  role     : ${ROLE}"
 echo "  declared : ${HOST}:${PORT}  (this script binds 0.0.0.0:${PORT})"
-echo "  GPU      : ${GPU}"
+echo "  CUDA dev : ${GPU}     (tensor-parallel-size=${TENSOR_PARALLEL_SIZE})"
 echo "  NIXL port: ${SIDE_CHANNEL}"
 echo "  model    : ${MODEL}"
+echo "  attn     : ${ATTENTION_BACKEND:-<vllm default>}"
+echo "  trust RC : ${TRUST_REMOTE_CODE}    enforce-eager: ${ENFORCE_EAGER}"
+if [[ -n "${UCX_NET_DEVICES:-}" ]]; then
+  echo "  UCX devs : ${UCX_NET_DEVICES}    UCX_TLS=${UCX_TLS:-<unset>}"
+fi
 if [[ "${TYPE}" == "homogeneous" ]]; then
   echo "  scheduler: HomogeneousScheduler  alpha=${ALPHA} budget_fn=${BUDGET_FN} min=${PREFILL_MIN} max=${PREFILL_MAX}"
 fi
@@ -125,7 +148,7 @@ echo "============================================================"
 # but is a no-op since we did not register_pid anything.
 #
 # ``${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}`` is the bash-safe way of expanding a
-# possibly-empty array under ``set -u`` (PD-disagg has no extra args).
+# possibly-empty array under ``set -u``.
 CUDA_VISIBLE_DEVICES="${GPU}" \
 VLLM_NIXL_SIDE_CHANNEL_PORT="${SIDE_CHANNEL}" \
 PYTHONPATH="${PYTHONPATH}" \
@@ -137,8 +160,7 @@ vllm serve "${MODEL}" \
   --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
-  --tensor-parallel-size 1 \
-  --enforce-eager \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} \
   --kv-transfer-config "${KV_CONFIG}" \
   2>&1 | tee "${LOG}"
