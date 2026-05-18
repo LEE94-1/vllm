@@ -87,7 +87,7 @@ case "${TYPE}" in
       exit 1
     fi
     ALPHA=${ALPHA:-16}
-    BUDGET_FN=${BUDGET_FN:-linear_ratio}
+    BUDGET_FN=${BUDGET_FN:-kv_decode_page}
     PREFILL_MIN=${PREFILL_MIN:-0}
     PREFILL_MAX=${PREFILL_MAX:-0}
     KV_EXTRA="\"kv_connector_extra_config\":{\"homogeneous_alpha\":${ALPHA},\"homogeneous_budget_fn\":\"${BUDGET_FN}\",\"homogeneous_prefill_min\":${PREFILL_MIN},\"homogeneous_prefill_max\":${PREFILL_MAX}}"

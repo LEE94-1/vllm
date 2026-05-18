@@ -32,8 +32,10 @@ for path in (_REPO_ROOT, _EXAMPLES_DIR):
         sys.path.insert(0, p)
 
 from homogeneous_pd.scheduler.budget_fn import (  # noqa: E402
+    ceil_to_page_size,
     fixed_cap,
     get_budget_fn,
+    kv_decode_page,
     linear_ratio,
 )
 from homogeneous_pd.scheduler.homogeneous_scheduler import (  # noqa: E402
@@ -69,7 +71,7 @@ pytestmark = pytest.mark.cpu_test
 def _make_scheduler(
     *,
     alpha: float = 16.0,
-    budget_fn: str = "linear_ratio",
+    budget_fn: str | None = "linear_ratio",
     prefill_min: int = 0,
     prefill_max: int = 0,
     max_num_seqs: int = 16,
@@ -112,9 +114,13 @@ def _make_scheduler(
         kv_connector_extra_config={
             "shared_storage_path": "local_storage",
             "homogeneous_alpha": alpha,
-            "homogeneous_budget_fn": budget_fn,
             "homogeneous_prefill_min": prefill_min,
             "homogeneous_prefill_max": prefill_max,
+            **(
+                {"homogeneous_budget_fn": budget_fn}
+                if budget_fn is not None
+                else {}
+            ),
         },
     )
     vllm_config = VllmConfig(
@@ -216,6 +222,66 @@ def test_fixed_cap_basic():
     assert fixed_cap(alpha=10000, decode_tokens=8, max_batched=128) == 120
 
 
+def test_ceil_to_page_size():
+    assert ceil_to_page_size(0, 16) == 0
+    assert ceil_to_page_size(1, 16) == 16
+    assert ceil_to_page_size(16, 16) == 16
+    assert ceil_to_page_size(17, 16) == 32
+
+
+def test_kv_decode_page_basic():
+    assert (
+        kv_decode_page(
+            decode_tokens=3,
+            kv_cache_tokens=4096,
+            kv_budget_ratio=1.0 / 4096.0,
+            decode_budget_ratio=1.0,
+            page_size=16,
+            max_batched=8192,
+        )
+        == 16
+    )
+    assert (
+        kv_decode_page(
+            decode_tokens=0,
+            kv_cache_tokens=8192,
+            kv_budget_ratio=1.0 / 4096.0,
+            decode_budget_ratio=1.0,
+            page_size=16,
+            max_batched=8192,
+        )
+        == 16
+    )
+    assert (
+        kv_decode_page(
+            decode_tokens=3,
+            kv_cache_tokens=0,
+            kv_budget_ratio=1.0 / 4096.0,
+            decode_budget_ratio=1.0,
+            page_size=16,
+            max_batched=8192,
+        )
+        == 16
+    )
+
+
+def test_kv_decode_page_clamped_to_remaining():
+    assert (
+        kv_decode_page(
+            decode_tokens=100,
+            kv_cache_tokens=0,
+            decode_budget_ratio=1000.0,
+            page_size=16,
+            max_batched=128,
+        )
+        == 28
+    )
+
+
+def test_get_budget_fn_kv_decode_page():
+    assert get_budget_fn("kv_decode_page") is kv_decode_page
+
+
 def test_get_budget_fn_unknown_raises():
     with pytest.raises(ValueError):
         get_budget_fn("does-not-exist")
@@ -232,6 +298,32 @@ def test_config_resolution_from_extra_config():
     assert sched.budget_fn_name == "fixed_cap"
     assert sched.prefill_min == 32
     assert sched.budget_fn is get_budget_fn("fixed_cap")
+
+
+def test_default_budget_fn_is_kv_decode_page():
+    sched = _make_scheduler(budget_fn=None)
+    assert sched.budget_fn_name == "kv_decode_page"
+    assert sched.kv_budget_ratio == pytest.approx(1.0 / 4096.0)
+    assert sched.decode_budget_ratio == pytest.approx(1.0)
+    assert sched.budget_fn is get_budget_fn("kv_decode_page")
+
+
+def test_kv_decode_page_caps_prefill_against_decode_count():
+    """3 decodes + 1 long waiting prefill -> prefill capped at one page."""
+    sched = _make_scheduler(budget_fn="kv_decode_page", max_num_batched_tokens=8192)
+    decodes = _drive_to_decode(sched, n_decodes=3, prompt_len=10)
+
+    new_prefill = create_requests(num_requests=1, num_tokens=2000, max_tokens=8)
+    for req in new_prefill:
+        sched.add_request(req)
+
+    out = sched.schedule()
+    decode_tokens = sum(out.num_scheduled_tokens[r.request_id] for r in decodes)
+    prefill_tokens = sum(
+        out.num_scheduled_tokens.get(r.request_id, 0) for r in new_prefill
+    )
+    assert decode_tokens == 3, "all decodes must be admitted first"
+    assert prefill_tokens == 16
 
 
 def test_no_decodes_uses_full_budget():

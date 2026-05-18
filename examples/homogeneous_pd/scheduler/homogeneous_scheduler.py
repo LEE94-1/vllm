@@ -19,11 +19,14 @@ Configuration (in priority order):
 
 1. ``vllm_config.kv_transfer_config.kv_connector_extra_config``:
    ``homogeneous_alpha``, ``homogeneous_budget_fn``,
+   ``homogeneous_kv_budget_ratio``, ``homogeneous_decode_budget_ratio``,
    ``homogeneous_prefill_min``, ``homogeneous_prefill_max``.
 2. Environment variables ``HOMOGENEOUS_ALPHA``, ``HOMOGENEOUS_BUDGET_FN``,
+   ``HOMOGENEOUS_KV_BUDGET_RATIO``, ``HOMOGENEOUS_DECODE_BUDGET_RATIO``,
    ``HOMOGENEOUS_PREFILL_MIN``, ``HOMOGENEOUS_PREFILL_MAX``.
-3. Defaults: ``alpha=16.0`` (matches the default vLLM page size),
-   ``budget_fn="linear_ratio"``, no min/max cap.
+3. Defaults: ``alpha=16.0`` (for ``linear_ratio``),
+   ``budget_fn="kv_decode_page"``, ``kv_budget_ratio=1/4096``,
+   ``decode_budget_ratio=1.0``, no min/max cap.
 """
 
 from __future__ import annotations
@@ -52,8 +55,10 @@ class HomogeneousScheduler(Scheduler):
        tokens that the base scheduler will issue this step (mirroring its own
        per-request token caps).
     2. Compute the per-step prefill budget via a pluggable function:
-       ``prefill_budget = budget_fn(num_decode_tokens, alpha=..., ...)``.
-       The default ``linear_ratio`` returns ``num_decode_tokens * alpha``.
+       ``prefill_budget = budget_fn(decode_tokens=..., kv_cache_tokens=..., ...)``.
+       The default ``kv_decode_page`` weights KV occupancy and decode tokens,
+       then rounds up to the vLLM page size; ``linear_ratio`` keys off decode
+       tokens only.
     3. Temporarily clamp ``self.max_num_scheduled_tokens`` to
        ``num_decode_tokens + prefill_budget`` (capped by the original maximum)
        and delegate to the base scheduler.
@@ -84,7 +89,13 @@ class HomogeneousScheduler(Scheduler):
 
         self.alpha: float = float(_resolve("homogeneous_alpha", 16.0))
         self.budget_fn_name: str = str(
-            _resolve("homogeneous_budget_fn", "linear_ratio")
+            _resolve("homogeneous_budget_fn", "kv_decode_page")
+        )
+        self.kv_budget_ratio: float = float(
+            _resolve("homogeneous_kv_budget_ratio", 1.0 / 4096.0)
+        )
+        self.decode_budget_ratio: float = float(
+            _resolve("homogeneous_decode_budget_ratio", 1.0)
         )
         self.prefill_min: int = int(_resolve("homogeneous_prefill_min", 0))
         self.prefill_max: int = int(_resolve("homogeneous_prefill_max", 0))
@@ -94,9 +105,13 @@ class HomogeneousScheduler(Scheduler):
 
         logger.info(
             "HomogeneousScheduler enabled: budget_fn=%s alpha=%.3f "
+            "kv_budget_ratio=%.6f decode_budget_ratio=%.3f page_size=%d "
             "prefill_min=%d prefill_max=%d max_num_batched_tokens=%d",
             self.budget_fn_name,
             self.alpha,
+            self.kv_budget_ratio,
+            self.decode_budget_ratio,
+            self.block_size,
             self.prefill_min,
             self.prefill_max,
             self._original_max_scheduled,
@@ -129,6 +144,19 @@ class HomogeneousScheduler(Scheduler):
                 total += n
         return total
 
+    def _estimate_kv_cache_tokens(self) -> tuple[float, int]:
+        """Estimate KV occupancy for budget functions.
+
+        vLLM exposes block-pool usage as a ratio, not an exact token counter.
+        We convert that ratio into an approximate token count so custom budget
+        functions can react to KV pressure without re-implementing block-pool
+        math.
+        """
+        usage = self.kv_cache_manager.usage
+        total_blocks = max(self.kv_cache_config.num_blocks - 1, 0)
+        kv_tokens = int(usage * total_blocks * self.block_size)
+        return usage, kv_tokens
+
     def schedule(self) -> SchedulerOutput:
         decode_estimate = self._estimate_decode_tokens()
         if decode_estimate <= 0:
@@ -136,11 +164,17 @@ class HomogeneousScheduler(Scheduler):
             # prefill (new or continuing) can ramp up unrestricted.
             return super().schedule()
 
+        kv_cache_usage, kv_cache_tokens = self._estimate_kv_cache_tokens()
         prefill_budget = int(
             self.budget_fn(
                 decode_tokens=decode_estimate,
                 alpha=self.alpha,
                 max_batched=self._original_max_scheduled,
+                kv_cache_usage=kv_cache_usage,
+                kv_cache_tokens=kv_cache_tokens,
+                kv_budget_ratio=self.kv_budget_ratio,
+                decode_budget_ratio=self.decode_budget_ratio,
+                page_size=self.block_size,
             )
         )
         if self.prefill_min > 0:

@@ -67,7 +67,7 @@ ATTENTION_BACKEND=${ATTENTION_BACKEND:-}
 
 # Homogeneous-PD-specific knobs (only used by run_homogeneous_*.sh).
 ALPHA=${ALPHA:-16}
-BUDGET_FN=${BUDGET_FN:-linear_ratio}
+BUDGET_FN=${BUDGET_FN:-kv_decode_page}
 PREFILL_MIN=${PREFILL_MIN:-0}
 PREFILL_MAX=${PREFILL_MAX:-0}
 
